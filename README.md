@@ -83,7 +83,7 @@ It's a single static file with no build step:
 - **GitHub Pages:** push this repo, then in **Settings → Pages** serve from the `main` branch
   root. The live demo is `index.html` at the repo's Pages URL.
 
-**Live demo:** _<add your GitHub Pages URL here>_
+**Live demo:** https://dlgkwls.github.io/python-basis/
 
 ## Notes
 
