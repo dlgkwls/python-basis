@@ -1,0 +1,5 @@
+# macOS
+.DS_Store
+
+# Local dev tooling (not part of the shipped app)
+.claude/

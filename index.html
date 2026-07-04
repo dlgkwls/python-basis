@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wafer-Map Yield Visualizer</title>
+<meta name="description" content="Paste die-level CSV and instantly see the wafer: bin map, yield %, and per-bin counts. Zero dependencies.">
+<!-- Google Fonts is the one allowed external link; the font stacks below degrade gracefully offline -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ===== design tokens (PRD §4 — exact values) ===== */
+:root{
+  --paper:#f3ede2;
+  --card:#fbf7ef;
+  --ink:#1c1813;
+  --ink-soft:#574d42;
+  --ink-faint:#8a7e6f;
+  --line:#d9cdba;
+  --accent:#41637f;
+  --pass:#7e9472;
+  --bin2:#cf3a26;   /* signal-red · continuity */
+  --bin3:#c0740b;   /* amber · leakage */
+  --bin4:#b8860b;   /* gold · parametric */
+  --bin5:#b8502e;   /* clay · functional/other */
+  --font-display:"Fraunces",Georgia,serif;
+  --font-body:"Hanken Grotesk",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  color-scheme:only light;
+}
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--paper);color:var(--ink);font-family:var(--font-body);line-height:1.5;accent-color:var(--accent)}
+
+/* ===== header strip (blueprint accent) ===== */
+header{background:var(--accent);color:var(--card);display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;padding:12px 20px}
+header h1{margin:0;font-family:var(--font-display);font-size:clamp(.95rem,2.5vw,1.15rem);font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.controls{margin-left:auto;display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-family:var(--font-mono);font-size:.78rem}
+.controls label{opacity:.88}
+.controls select,.controls input{font-family:var(--font-mono);font-size:.78rem;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 6px}
+.controls input{width:7ch;text-align:right}
+
+/* ===== layout — mobile-first single column; on desktop the input sits beside the map and the stats span full width below ===== */
+main{max-width:1080px;margin:18px auto 40px;padding:0 16px;display:grid;gap:16px;grid-template-columns:minmax(0,1fr);grid-template-areas:"input" "map" "stats"}
+#inputPanel{grid-area:input;min-width:0}
+#mapCard{grid-area:map;min-width:0}
+#statsCard{grid-area:stats;min-width:0}
+@media(min-width:700px){
+  /* cap the map column near the wafer's own max size and center the grid, so wide screens stay tight rather than stretching */
+  main{grid-template-columns:minmax(260px,320px) minmax(0,560px);grid-template-areas:"input map" "stats stats";align-items:start;justify-content:center}
+}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.panel-label{font-family:var(--font-mono);font-size:.68rem;font-weight:500;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 10px}
+
+/* ===== input panel (a <details> so it collapses into an accordion on mobile, per §9) ===== */
+#inputPanel summary{cursor:pointer;font-family:var(--font-mono);font-size:.68rem;font-weight:500;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:10px}
+@media(min-width:700px){
+  #inputPanel summary{pointer-events:none;list-style:none}   /* desktop: it's just the panel label */
+  #inputPanel summary::-webkit-details-marker{display:none}
+}
+textarea{width:100%;min-height:190px;resize:vertical;font-family:var(--font-mono);font-size:.74rem;line-height:1.55;color:var(--ink);background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:10px}
+textarea:focus,select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
+.btn{font-family:var(--font-body);font-weight:600;font-size:.85rem;border-radius:8px;padding:8px 14px;cursor:pointer;border:1px solid transparent}
+.btn.primary{background:var(--accent);color:var(--card)}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent;color:var(--ink-soft);border-color:var(--line)}
+.btn.ghost:hover{border-color:var(--ink-faint)}
+.btn-row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.file-row{margin-top:10px}
+.visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.download{display:inline-block;margin-top:12px;font-family:var(--font-mono);font-size:.72rem;color:var(--accent)}
+
+/* ===== parse log: info ink-soft · warnings amber · errors clay with clay border (§9 error state) ===== */
+.log{margin-top:12px;font-family:var(--font-mono);font-size:.72rem;line-height:1.7;color:var(--ink-soft);white-space:pre-wrap;word-break:break-word}
+.log div.warn{color:var(--bin3)}
+.log div.error{color:var(--bin5)}
+.log.error{border:1px solid var(--bin5);border-radius:8px;padding:8px 10px}
+
+/* ===== empty state ===== */
+#emptyState p{color:var(--ink-soft);font-size:.92rem;max-width:52ch;margin:0 0 12px}
+.schema{font-family:var(--font-mono);font-size:.72rem;line-height:1.6;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto;color:var(--ink-soft);margin:0 0 14px;max-width:32ch}
+
+/* ===== wafer map ===== */
+#mapWrap svg{display:block;width:100%;max-width:540px;height:auto;margin:0 auto}
+.wafer-edge{fill:none;stroke:var(--ink-faint);stroke-width:.14}
+.d{stroke:none}
+/* one class per bin: fill colors the SVG die, background-color colors the legend swatch */
+.b1{fill:var(--pass);background-color:var(--pass)}
+.b2{fill:var(--bin2);background-color:var(--bin2)}
+.b3{fill:var(--bin3);background-color:var(--bin3)}
+.b4{fill:var(--bin4);background-color:var(--bin4)}
+.b5{fill:var(--bin5);background-color:var(--bin5)}
+.bx{fill:var(--ink-faint);background-color:var(--ink-faint)}   /* bins outside 1–5 → gray "other" */
+
+/* ===== stats ===== */
+.stat-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 36px}
+.stat-label{display:block;font-family:var(--font-mono);font-size:.68rem;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint)}
+.yield-hero{font-family:var(--font-display);font-weight:700;font-size:clamp(2.4rem,6vw,3.4rem);line-height:1.05;color:var(--ink)}
+.stat-mono{font-family:var(--font-mono);font-size:1.25rem;color:var(--ink)}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.chip{display:inline-flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:.74rem;color:var(--ink-soft)}
+.swatch{width:11px;height:11px;border-radius:3px;flex:none}
+
+/* ===== sub-stats: pareto (FR-5) + edge/center (FR-6), side by side on desktop ===== */
+.substats{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px 28px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+.sub-label{font-family:var(--font-mono);font-size:.68rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 10px;display:flex;align-items:center;gap:6px}
+/* ===== FR-11: inline info icons + click-to-open concept popover (CLICK only — hover belongs to the FR-7 die tooltip) ===== */
+/* previous icon shape (Fraunces italic "i", light ring), now a click button instead of a hover hint */
+.info-btn{-webkit-appearance:none;appearance:none;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;border:1px solid var(--line);border-radius:50%;background:transparent;color:var(--ink-faint);font-family:var(--font-display);font-style:italic;font-size:.62rem;line-height:1;cursor:pointer;vertical-align:middle;flex:none;transition:background-color .12s,color .12s,border-color .12s}
+.stat-label .info-btn{margin-left:5px}            /* this label isn't a flex row, so nudge the icon off the text */
+.info-btn:hover{border-color:var(--ink-faint)}
+.info-btn[aria-expanded="true"]{background:var(--ink-faint);border-color:var(--ink-faint);color:var(--card)}   /* filled while its popover is open */
+.info-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+/* header sits on the blueprint accent fill — recolor so the muted icon stays legible there */
+header .info-btn{border-color:var(--card);color:var(--card)}
+header .info-btn[aria-expanded="true"]{background:var(--card);border-color:var(--card);color:var(--accent)}
+header .info-btn:focus-visible{outline-color:var(--card)}
+/* one shared popover, positioned in JS; flat card with only a faint shadow */
+.info-pop{position:fixed;z-index:40;max-width:260px;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;box-shadow:0 4px 14px rgba(28,24,19,.12);font-family:var(--font-body);font-size:.82rem;line-height:1.45;color:var(--ink-soft);opacity:0;visibility:hidden;transition:opacity .12s}
+.info-pop.open{opacity:1;visibility:visible}
+.info-pop h4{margin:0 0 4px;font-family:var(--font-mono);font-size:.64rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
+.info-pop p{margin:0}
+/* labeled separator above the bin legend, matching the pareto/edge sub-labels */
+.legend-block{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.legend-block .legend{margin-top:0;padding-top:0;border-top:0}
+/* pareto: one horizontal bar per fail bin, descending */
+.pareto-row{margin-bottom:9px}
+.pareto-meta{font-family:var(--font-mono);font-size:.7rem;color:var(--ink-soft);margin-bottom:3px}
+.pareto-track{background:var(--paper);border:1px solid var(--line);border-radius:4px;height:13px;overflow:hidden}
+.pareto-bar{height:100%;min-width:2px}
+.zero-note{font-family:var(--font-mono);font-size:.72rem;color:var(--ink-soft)}
+/* edge vs center */
+.zone-grid{display:flex;gap:10px}
+.zone{flex:1;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+.zone-name{display:block;font-family:var(--font-mono);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint)}
+.zone-yield{display:block;font-family:var(--font-mono);font-size:1.15rem;color:var(--ink);margin:2px 0 1px}
+.zone-n{font-family:var(--font-mono);font-size:.66rem;color:var(--ink-faint)}
+.zone-delta{font-family:var(--font-mono);font-size:.74rem;color:var(--ink-soft);margin-top:9px}
+
+/* ===== die hover tooltip (FR-7) — fixed-position, follows the cursor ===== */
+.die-tip{position:fixed;z-index:20;pointer-events:none;background:var(--ink);color:var(--card);font-family:var(--font-mono);font-size:.72rem;padding:5px 8px;border-radius:6px;white-space:nowrap;opacity:0;transition:opacity .08s}
+.die-tip.show{opacity:1}
+#mapWrap rect.d{cursor:crosshair}
+
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Wafer-Map Yield Visualizer</h1>
+  <div class="controls">
+    <label for="sampleSelect">Load sample</label>
+    <select id="sampleSelect">
+      <option value="" selected>choose…</option>
+      <option value="edge">Edge ring</option>
+      <option value="center">Center cluster</option>
+      <option value="random">Random</option>
+    </select>
+    <label for="seedInput">seed</label>
+    <input id="seedInput" value="2026" inputmode="numeric" autocomplete="off">
+    <button class="info-btn" type="button" data-info="seed" aria-label="What is the seed?" aria-expanded="false" aria-haspopup="dialog" aria-controls="infoPop">i</button>
+  </div>
+</header>
+
+<main>
+  <details class="card" id="inputPanel" open>
+    <summary>Input — paste die-level CSV</summary>
+    <textarea id="csvInput" spellcheck="false" aria-label="Die-level CSV input"
+      placeholder="die_x,die_y,bin&#10;0,0,1&#10;1,0,1&#10;0,1,2"></textarea>
+    <div class="file-row">
+      <label class="btn ghost">Choose .csv file<input class="visually-hidden" type="file" id="fileInput" accept=".csv,text/csv"></label>
+    </div>
+    <div class="btn-row">
+      <button id="renderBtn" class="btn primary">Render map</button>
+      <button id="clearBtn" class="btn ghost">Clear</button>
+    </div>
+    <a id="downloadLink" class="download" download hidden>Download sample CSV</a>
+    <div id="parseLog" class="log" hidden></div>
+  </details>
+
+  <div class="card" id="mapCard">
+    <p class="panel-label">Wafer map</p>
+      <div id="emptyState">
+        <p>Paste die-level CSV — one row per tested die — and this renders the wafer:
+           a bin-colored map, overall yield, and per-bin counts. Bin 1 is pass; bins ≥ 2 are fails.</p>
+        <pre class="schema">die_x,die_y,bin
+-3,0,1
+-2,0,1
+-1,0,3
+0,0,1
+1,0,1</pre>
+        <button id="sampleBtn" class="btn primary">Load sample → edge ring</button>
+      </div>
+      <div id="mapWrap" hidden></div>
+    </div>
+
+    <div class="card" id="statsCard" hidden>
+      <p class="panel-label">Stats</p>
+      <div class="stat-row">
+        <div><span class="stat-label">yield<button class="info-btn" type="button" data-info="yield" aria-label="What is yield?" aria-expanded="false" aria-haspopup="dialog" aria-controls="infoPop">i</button></span><span class="yield-hero" id="yieldVal">—</span></div>
+        <div><span class="stat-label">die</span><span class="stat-mono" id="dieVal"></span></div>
+        <div><span class="stat-label">pass</span><span class="stat-mono" id="passVal"></span></div>
+      </div>
+      <div class="legend-block">
+        <p class="sub-label">Bin legend<button class="info-btn" type="button" data-info="legend" aria-label="What do the bins mean?" aria-expanded="false" aria-haspopup="dialog" aria-controls="infoPop">i</button></p>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div class="substats">
+        <div>
+          <p class="sub-label">Fail pareto<button class="info-btn" type="button" data-info="pareto" aria-label="What is a fail pareto?" aria-expanded="false" aria-haspopup="dialog" aria-controls="infoPop">i</button></p>
+          <div id="pareto"></div>
+        </div>
+        <div>
+          <p class="sub-label">Edge vs center<button class="info-btn" type="button" data-info="edge" aria-label="What is edge vs center?" aria-expanded="false" aria-haspopup="dialog" aria-controls="infoPop">i</button></p>
+          <div id="zones"></div>
+        </div>
+      </div>
+    </div>
+</main>
+
+<div id="dieTip" class="die-tip" role="status" aria-live="off"></div>
+
+<script>
+'use strict';
+
+/* ===== bins ===== */
+const BIN_NAMES = {1:'pass', 2:'continuity', 3:'leakage', 4:'parametric', 5:'functional'};
+const binClass = b => (b >= 1 && b <= 5) ? 'b' + b : 'bx';   // bx = gray "other" for bins outside 1–5
+const binName  = b => BIN_NAMES[b] || 'other';
+
+/* ===== seedable PRNG — mulberry32: same seed in, same number stream out, so maps reproduce exactly ===== */
+function mulberry32(seed){
+  let a = seed >>> 0;
+  return function(){
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ===== sample generators (§6): disc of every integer (x,y) with sqrt(x²+y²) ≤ R, R = 20 ===== */
+const R_GEN = 20;
+const GENERATORS = {
+  edge:   { label:'edge ring',      pFail: r => 0.02 + 0.55 * Math.max(0, (r - 0.75) / 0.25) ** 2 },
+  center: { label:'center cluster', pFail: r => 0.02 + 0.60 * Math.exp(-((r / 0.25) ** 2)) },
+  random: { label:'random',         pFail: () => 0.05 },
+};
+function generateSample(kind, seed){
+  const rnd = mulberry32(seed);
+  const g = GENERATORS[kind];
+  const rows = ['die_x,die_y,bin'];
+  // fixed scan order (y then x, ascending) keeps the PRNG stream — and therefore the map — reproducible
+  for(let y = -R_GEN; y <= R_GEN; y++){
+    for(let x = -R_GEN; x <= R_GEN; x++){
+      const dist = Math.hypot(x, y);
+      if(dist > R_GEN) continue;
+      let bin = 1;
+      if(rnd() < g.pFail(dist / R_GEN)){
+        const v = rnd();   // second draw only on a fail: weighted bin pick 40/30/20/10 (§6)
+        bin = v < 0.40 ? 2 : v < 0.70 ? 3 : v < 0.90 ? 4 : 5;
+      }
+      rows.push(x + ',' + y + ',' + bin);
+    }
+  }
+  return rows.join('\n');
+}
+
+/* ===== CSV parser (§5 contract, §10 error handling) ===== */
+const INT_RE = /^[+-]?\d+$/;   // strict integer check: "3.0" and "" both fail it
+const ROW_CAP = 20000;
+function parseCSV(text){
+  const lines = text.split(/\r\n|\r|\n/);
+  let headerIdx = -1;
+  for(let i = 0; i < lines.length; i++){
+    if(lines[i].trim() !== ''){ headerIdx = i; break; }
+  }
+  if(headerIdx === -1) return { error: 'No data found.' };
+
+  // header match is by name: case-insensitive, trimmed, any column order, extras ignored (§5)
+  const header = lines[headerIdx].split(',').map(c => c.trim().toLowerCase());
+  const col = { die_x: header.indexOf('die_x'), die_y: header.indexOf('die_y'), bin: header.indexOf('bin') };
+  const missing = Object.keys(col).filter(k => col[k] === -1);
+  if(missing.length) return { error: 'Missing required column(s): ' + missing.join(', ') + '. Header must include die_x, die_y, bin.' };
+
+  let dataRows = 0;
+  for(let i = headerIdx + 1; i < lines.length; i++) if(lines[i].trim() !== '') dataRows++;
+  if(dataRows > ROW_CAP) return { error: dataRows.toLocaleString('en-US') + ' rows — limit is 20,000 to keep the SVG map responsive.' };
+
+  const dies = new Map();   // keyed "x,y": setting an existing key implements "last row wins"
+  const skipped = [];
+  let overwritten = 0;
+  for(let i = headerIdx + 1; i < lines.length; i++){
+    if(lines[i].trim() === '') continue;
+    const cells = lines[i].split(',');
+    const lineNo = i + 1;   // 1-based and counts the header, so the 3rd data row is "line 4"
+    let bad = null;
+    const vals = {};
+    for(const name of ['die_x', 'die_y', 'bin']){
+      const cell = (cells[col[name]] ?? '').trim();
+      if(cell === ''){ bad = 'blank ' + name; break; }
+      if(!INT_RE.test(cell)){ bad = 'non-integer ' + name; break; }
+      vals[name] = parseInt(cell, 10);
+    }
+    if(bad){ skipped.push('line ' + lineNo + ': ' + bad); continue; }
+    const key = vals.die_x + ',' + vals.die_y;
+    if(dies.has(key)) overwritten++;
+    dies.set(key, { x: vals.die_x, y: vals.die_y, bin: vals.bin });
+  }
+  if(dies.size === 0) return { error: 'No valid rows. Expected header die_x,die_y,bin with integer fields — see the schema in the empty state.', skipped };
+  return { dies: [...dies.values()], skipped, overwritten };
+}
+
+/* ===== stats (§8): yield = 100 · bin-1 count / total after dedupe, 1 decimal ===== */
+function computeStats(dies){
+  const total = dies.length;
+  let pass = 0;
+  const counts = new Map();
+  for(const d of dies){
+    if(d.bin === 1) pass++;
+    counts.set(d.bin, (counts.get(d.bin) || 0) + 1);
+  }
+  return { total, pass, yieldPct: (100 * pass / total).toFixed(1), counts };
+}
+
+/* ===== edge vs center (§8): r = dist / R_data, R_data = max dist over all die; edge if r ≥ 0.85 ===== */
+function computeZones(dies){
+  let rData = 0;
+  for(const d of dies) rData = Math.max(rData, Math.hypot(d.x, d.y));
+  const z = { edge: { total: 0, pass: 0 }, center: { total: 0, pass: 0 } };
+  for(const d of dies){
+    const r = rData === 0 ? 0 : Math.hypot(d.x, d.y) / rData;   // data-driven, so partial maps still work
+    const zone = r >= 0.85 ? 'edge' : 'center';
+    z[zone].total++;
+    if(d.bin === 1) z[zone].pass++;
+  }
+  const yld = s => s.total ? 100 * s.pass / s.total : null;     // null = zone has no die (e.g. tiny fixture)
+  const ey = yld(z.edge), cy = yld(z.center);
+  return {
+    edge: z.edge, center: z.center, edgeYield: ey, centerYield: cy,
+    delta: (ey === null || cy === null) ? null : cy - ey        // center − edge, signed
+  };
+}
+
+/* ===== UI wiring (everything below touches the DOM) ===== */
+const $ = id => document.getElementById(id);
+const csvInput = $('csvInput'), fileInput = $('fileInput'), renderBtn = $('renderBtn'), clearBtn = $('clearBtn'),
+      parseLog = $('parseLog'), emptyState = $('emptyState'), mapWrap = $('mapWrap'), statsCard = $('statsCard'),
+      yieldVal = $('yieldVal'), dieVal = $('dieVal'), passVal = $('passVal'), legend = $('legend'),
+      sampleSelect = $('sampleSelect'), seedInput = $('seedInput'), sampleBtn = $('sampleBtn'),
+      downloadLink = $('downloadLink'), inputPanel = $('inputPanel'),
+      pareto = $('pareto'), zones = $('zones'), dieTip = $('dieTip');
+
+const escapeHTML = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function showLog(entries, isError){
+  parseLog.hidden = entries.length === 0;
+  parseLog.classList.toggle('error', !!isError);
+  parseLog.innerHTML = entries.map(e => '<div class="' + (e.kind || 'info') + '">' + escapeHTML(e.text) + '</div>').join('');
+}
+
+function skippedSummary(skipped){
+  const n = skipped.length;
+  const shown = skipped.slice(0, 5).join('; ');
+  const more = n > 5 ? '; +' + (n - 5) + ' more' : '';
+  return n + ' row' + (n === 1 ? '' : 's') + ' skipped (' + shown + more + ')';
+}
+
+function drawWafer(dies){
+  let rMax = 0;
+  for(const d of dies) rMax = Math.max(rMax, Math.hypot(d.x, d.y));
+  const circleR = rMax + 0.9;            // wafer outline clears the outermost die's corners
+  const vb = +(circleR + 0.35).toFixed(2);
+  let rects = '';
+  for(const d of dies){
+    // y is negated: in the CSV +y points up, but SVG's y axis points down
+    // data-* carry the original coords/bin so the hover tooltip (FR-7) can read them back
+    rects += '<rect class="d ' + binClass(d.bin) + '" x="' + (d.x - 0.46).toFixed(2) +
+             '" y="' + (-d.y - 0.46).toFixed(2) + '" width="0.92" height="0.92"' +
+             ' data-x="' + d.x + '" data-y="' + d.y + '" data-bin="' + d.bin + '"></rect>';
+  }
+  mapWrap.innerHTML =
+    '<svg viewBox="' + (-vb) + ' ' + (-vb) + ' ' + (vb * 2) + ' ' + (vb * 2) + '" role="img" aria-label="Wafer bin map" xmlns="http://www.w3.org/2000/svg">' +
+    '<circle class="wafer-edge" cx="0" cy="0" r="' + circleR.toFixed(2) + '"></circle>' + rects + '</svg>';
+}
+
+function drawStats(stats){
+  yieldVal.textContent = stats.yieldPct + ' %';
+  dieVal.textContent = stats.total.toLocaleString('en-US');
+  passVal.textContent = stats.pass.toLocaleString('en-US');
+  const bins = [...stats.counts.keys()].sort((a, b) => a - b);
+  legend.innerHTML = bins.map(b =>
+    '<span class="chip"><span class="swatch ' + binClass(b) + '"></span>bin ' + b + ' · ' + binName(b) +
+    ' · ' + stats.counts.get(b).toLocaleString('en-US') + '</span>'
+  ).join('');
+}
+
+/* FR-5: horizontal bars for fail bins (any bin ≠ 1), descending by count; bar width ∝ count */
+function drawPareto(stats){
+  const fails = [...stats.counts.entries()].filter(([b]) => b !== 1);
+  const totalFails = fails.reduce((s, [, c]) => s + c, 0);
+  if(totalFails === 0){ pareto.innerHTML = '<div class="zero-note">No fails — 100.0 % yield.</div>'; return; }
+  fails.sort((a, b) => b[1] - a[1] || a[0] - b[0]);   // count desc; ties broken by bin number
+  const max = fails[0][1];
+  pareto.innerHTML = fails.map(([b, c]) => {
+    const share = (100 * c / totalFails).toFixed(1);   // % of fails (§8)
+    const width = (100 * c / max).toFixed(1);          // bar length relative to the top bin
+    return '<div class="pareto-row">' +
+      '<div class="pareto-meta">bin ' + b + ' · ' + binName(b) + ' · ' + c.toLocaleString('en-US') + ' · ' + share + '% of fails</div>' +
+      '<div class="pareto-track"><div class="pareto-bar ' + binClass(b) + '" style="width:' + width + '%"></div></div>' +
+      '</div>';
+  }).join('');
+}
+
+/* FR-6: center & edge yields side by side, plus the signed center − edge delta */
+function fmtYield(v){ return v === null ? '—' : v.toFixed(1) + ' %'; }
+function drawZones(z){
+  const cell = (name, zy, s) =>
+    '<div class="zone"><span class="zone-name">' + name + '</span>' +
+    '<span class="zone-yield">' + fmtYield(zy) + '</span>' +
+    '<span class="zone-n">' + s.total.toLocaleString('en-US') + ' die</span></div>';
+  let delta;
+  if(z.delta === null) delta = 'center − edge = — (a zone is empty)';
+  else { const sign = z.delta > 0 ? '+' : (z.delta < 0 ? '−' : ''); delta = 'center − edge = ' + sign + Math.abs(z.delta).toFixed(1) + ' pts'; }
+  zones.innerHTML =
+    '<div class="zone-grid">' + cell('center', z.centerYield, z.center) + cell('edge', z.edgeYield, z.edge) + '</div>' +
+    '<div class="zone-delta">' + delta + '</div>';
+}
+
+function renderFromText(text, note){
+  if(text.trim() === ''){
+    showLog([{ text: 'Paste die-level CSV first — or load a sample.', kind: 'info' }]);   // gentle prompt, not an error (§10)
+    return;
+  }
+  const res = parseCSV(text);
+  const entries = [];
+  if(res.error){
+    entries.push({ text: res.error, kind: 'error' });
+    if(res.skipped && res.skipped.length) entries.push({ text: skippedSummary(res.skipped), kind: 'warn' });
+    showLog(entries, true);   // error state: clay-bordered log; any prior render stays put
+    return;
+  }
+  if(note) entries.push({ text: note, kind: 'info' });
+  entries.push({ text: res.dies.length.toLocaleString('en-US') + ' die rendered', kind: 'info' });
+  if(res.skipped.length) entries.push({ text: skippedSummary(res.skipped), kind: 'warn' });
+  if(res.overwritten) entries.push({ text: 'Duplicate (x, y): ' + res.overwritten + ' die overwritten (last row wins)', kind: 'warn' });
+  showLog(entries, false);
+  const stats = computeStats(res.dies);
+  drawWafer(res.dies);
+  drawStats(stats);
+  drawPareto(stats);
+  drawZones(computeZones(res.dies));
+  emptyState.hidden = true;
+  mapWrap.hidden = false;
+  statsCard.hidden = false;
+}
+
+/* ===== samples + seed ===== */
+function readSeed(){
+  const v = seedInput.value.trim();
+  if(INT_RE.test(v)) return parseInt(v, 10);
+  seedInput.value = '2026';   // invalid/blank seed quietly falls back to the documented default
+  return 2026;
+}
+
+let sampleURL = null;
+function loadSample(kind){
+  const seed = readSeed();
+  const csv = generateSample(kind, seed);
+  csvInput.value = csv;       // the sample lands in the paste box too, so it can be inspected or re-pasted
+  fileInput.value = '';
+  renderFromText(csv, 'Loaded sample: ' + GENERATORS[kind].label + ' · seed ' + seed);
+  if(sampleURL) URL.revokeObjectURL(sampleURL);
+  sampleURL = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  downloadLink.href = sampleURL;
+  downloadLink.download = 'wafer-sample-' + kind + '-seed-' + seed + '.csv';
+  downloadLink.textContent = 'Download ' + GENERATORS[kind].label + ' CSV (seed ' + seed + ')';
+  downloadLink.hidden = false;
+}
+
+function clearAll(){
+  csvInput.value = '';
+  fileInput.value = '';
+  showLog([]);
+  parseLog.classList.remove('error');
+  mapWrap.hidden = true;
+  mapWrap.innerHTML = '';
+  dieTip.classList.remove('show');
+  statsCard.hidden = true;
+  emptyState.hidden = false;
+  downloadLink.hidden = true;
+  if(sampleURL){ URL.revokeObjectURL(sampleURL); sampleURL = null; }
+  sampleSelect.value = '';
+}
+
+/* ===== events ===== */
+renderBtn.addEventListener('click', () => renderFromText(csvInput.value));
+clearBtn.addEventListener('click', clearAll);
+sampleBtn.addEventListener('click', () => loadSample('edge'));
+sampleSelect.addEventListener('change', () => { if(sampleSelect.value) loadSample(sampleSelect.value); });
+/* FR-7: hover any die → "(x, y) · bin n · pass/fail". Delegated on mapWrap, which persists across renders. */
+mapWrap.addEventListener('mousemove', e => {
+  const rect = e.target.closest('rect.d');
+  if(!rect){ dieTip.classList.remove('show'); return; }
+  const b = +rect.getAttribute('data-bin');
+  dieTip.textContent = '(' + rect.getAttribute('data-x') + ', ' + rect.getAttribute('data-y') +
+                       ') · bin ' + b + ' · ' + (b === 1 ? 'pass' : 'fail');
+  dieTip.style.left = (e.clientX + 12) + 'px';
+  dieTip.style.top  = (e.clientY + 12) + 'px';
+  dieTip.classList.add('show');
+});
+mapWrap.addEventListener('mouseleave', () => dieTip.classList.remove('show'));
+
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files && fileInput.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = () => { csvInput.value = reader.result; renderFromText(reader.result, 'Loaded file: ' + f.name); };
+  reader.readAsText(f);
+});
+
+/* input panel: forced open on desktop (summary is just a label there), collapsible accordion on mobile */
+const mq = matchMedia('(min-width: 700px)');
+const syncPanel = () => { if(mq.matches) inputPanel.open = true; };
+mq.addEventListener('change', syncPanel);
+if(!mq.matches) inputPanel.open = false;
+syncPanel();
+
+/* ===== FR-11: inline info icons → click-to-open concept popover =====
+   CLICK toggles open/close; click-outside or Escape closes; only one open at a time.
+   Hover is deliberately NOT used here — the per-die hover tooltip (FR-7) owns hover. */
+const GLOSSARY = {
+  seed:   { title:'Seed',           body:'A starting number for the random generator. The same seed always rebuilds the exact same wafer, so any result is reproducible.' },
+  yield:  { title:'Yield',          body:'Share of tested die that passed (bin 1), out of all die after dedupe. The headline number every fab watches.' },
+  legend: { title:'Bin codes',      body:"The code each die gets at wafer sort. 1 = pass; 2–5 are failure categories: continuity, leakage, parametric, functional. Above 5 shows gray as 'other'." },
+  pareto: { title:'Fail pareto',    body:'Fail counts ranked high to low. Answers the second question an engineer asks: which failure mode is hurting yield the most?' },
+  edge:   { title:'Edge vs center', body:'Compares yield in the outer ring (r ≥ 0.85) against the interior. A large gap means the failure is spatial, which is a strong clue to the root cause.' },
+};
+
+// one shared popover element for all five icons, so only one can ever be open
+const infoPop = document.createElement('div');
+infoPop.className = 'info-pop';
+infoPop.id = 'infoPop';
+infoPop.setAttribute('role', 'dialog');
+infoPop.setAttribute('aria-label', 'Concept explanation');
+document.body.appendChild(infoPop);
+
+let openInfoBtn = null;
+
+function closeInfo(){
+  if(!openInfoBtn) return;
+  infoPop.classList.remove('open');
+  openInfoBtn.setAttribute('aria-expanded', 'false');
+  openInfoBtn.removeAttribute('aria-describedby');
+  openInfoBtn = null;
+}
+
+function openInfo(btn){
+  const g = GLOSSARY[btn.getAttribute('data-info')];
+  if(!g) return;
+  infoPop.innerHTML = (g.title ? '<h4>' + escapeHTML(g.title) + '</h4>' : '') + '<p>' + escapeHTML(g.body) + '</p>';
+  infoPop.classList.add('open');                              // lay it out so we can measure it
+  const r = btn.getBoundingClientRect();
+  const pw = infoPop.offsetWidth, ph = infoPop.offsetHeight;
+  const M = 8, vw = document.documentElement.clientWidth, vh = window.innerHeight;
+  const left = Math.min(Math.max(M, r.left), vw - pw - M);    // clamp inside viewport → no horizontal scroll at 380 px
+  let top = r.bottom + 6;                                     // prefer just below the icon...
+  if(top + ph > vh - M) top = r.top - ph - 6;                // ...flip above if there's no room below
+  if(top < M) top = M;
+  infoPop.style.left = Math.round(left) + 'px';
+  infoPop.style.top  = Math.round(top) + 'px';
+  btn.setAttribute('aria-expanded', 'true');
+  btn.setAttribute('aria-describedby', 'infoPop');           // so screen readers announce the explanation
+  openInfoBtn = btn;
+}
+
+document.addEventListener('click', e => {
+  const btn = e.target.closest(".info-btn");
+  if(btn){
+    e.preventDefault();
+    if(openInfoBtn === btn) closeInfo();        // re-click the same icon → close
+    else { closeInfo(); openInfo(btn); }        // otherwise close any other and open this one
+    return;
+  }
+  if(openInfoBtn && !infoPop.contains(e.target)) closeInfo();   // any click outside closes
+});
+document.addEventListener('keydown', e => { if(e.key === 'Escape') closeInfo(); });
+// a fixed-position popover would drift if the page scrolled or resized, so just close it
+window.addEventListener('scroll', closeInfo, true);
+window.addEventListener('resize', closeInfo);
+</script>
+</body>
+</html>
